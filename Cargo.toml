@@ -1,0 +1,16 @@
+[package]
+name = "obsidian-sync"
+version = "0.1.0"
+authors = ["Conner Holden <80974257+cloud303-cholden@users.noreply.github.com>"]
+description = "Manually sync Markdown files from Obsidian vault to and from Amazon S3."
+edition = "2021"
+categories = ["command-line-utilities"]
+
+[dependencies]
+aws-config = "0.54"
+aws-sdk-s3 = "0.24"
+dirs = "1.0"
+toml = "0.7"
+serde = "1.0"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
