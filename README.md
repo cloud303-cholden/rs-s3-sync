@@ -22,6 +22,11 @@ paths = [
 bucket = "aws-bucket-name"  # Only the name is needed. No S3 URI prefix required.
 profile = "aws-profile"     # AWS profile name. If not specified, AWS credentials will be retrieved from the environment.
 ```
+### Usage
+This is just a simple executable for now. No arguments or flags are supported.
+```sh
+s3-sync
+```
 ### Implementation Notes
 - Currently the full path of system files are copied to S3. This means that syncing files between systems will only work as expected if the paths are the exact same in both systems.
 - The logic for deciding between uploading versus downloading is the last modified date of the file. This is tracked in a `manifest.json` file in the root of the S3 bucket. Deleting or altering this manifest will produce unexpected results.
