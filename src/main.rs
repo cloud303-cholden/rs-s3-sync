@@ -1,149 +1,153 @@
-use aws_sdk_s3::{
-    output::GetObjectOutput,
-    Client as S3Client,
-    types::{
-        ByteStream,
-        AggregatedBytes,
-        DateTime,
-    }
-};
-use dirs::{
-    config_dir,
-    document_dir,
-};
-use serde::Deserialize;
 use std::{
-    cmp::Ordering,
-    collections::HashMap,
-    convert::TryFrom,
-    error::Error,
-    ffi::OsStr,
-    fs::{
-        File,
-        OpenOptions,
-        read_to_string,
-        read_dir,
-    },
+    collections::{HashMap, HashSet},
     io::Write,
     path::PathBuf,
-    process::exit,
+    str::FromStr,
     time::SystemTime,
 };
 
-#[derive(Deserialize)]
+use anyhow::Result;
+use aws_config::BehaviorVersion;
+use aws_sdk_s3::primitives::{AggregatedBytes, ByteStream};
+use serde::{Deserialize, Serialize};
+
+#[derive(Deserialize, Serialize)]
 struct Config {
-    dir: Option<PathBuf>,
-    aws_profile: Option<String>,
-    aws_bucket: String,
+    paths: Vec<PathBuf>,
+    aws: Aws,
+}
+
+#[derive(Deserialize, Serialize)]
+struct Aws {
+    profile: Option<String>,
+    bucket: String,
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>>{
-    let config_path: PathBuf = match config_dir() {
-        Some(p) => p,
-        _ => {
-            eprintln!("Failed to find configuration directory!");
-            exit(1);
-        }
+async fn main() -> Result<()> {
+    let config_path = match std::env::var("S3_SYNC_CONFIG") {
+        Ok(p) => PathBuf::from_str(&p).unwrap(),
+        Err(_) => dirs::config_dir()
+            .unwrap()
+            .join("s3-sync")
+            .join("config.toml"),
     };
-    let sync_config_path = config_path.join("obsidian").join("obsidian-sync.toml");
-    let sync_config_string = match read_to_string(sync_config_path) {
-        Ok(c) => c,
-        Err(_) => {
-            eprintln!("Failed to find sync configuration file!");
-            exit(1);
-        }
-    };
-    let sync_config: Config = match toml::from_str(&sync_config_string) {
-        Ok(c) => c,
-        Err(_) => {
-            eprintln!("Failed to parse configuration file!");
-            exit(1);
-        }
-    };
-    let dir = match sync_config.dir {
-        Some(d) => d,
-        _ => get_default_dir().unwrap(),
-    };
-    let local_files: Vec<PathBuf> = read_dir(&dir)
-        .map(|res| res.map(|e| e.unwrap().path()))
-        .unwrap()
-        .collect::<Vec<PathBuf>>();
+    let config_str = std::fs::read_to_string(config_path).unwrap();
+    let config: Config = toml::from_str(&config_str).unwrap();
 
-    let profile = match &sync_config.aws_profile {
-        Some(p) => p,
-        _ => "default",
-    };
+    let mut aws_config_loader = aws_config::defaults(BehaviorVersion::v2023_11_09());
+    if let Some(profile) = config.aws.profile {
+        aws_config_loader = aws_config_loader.profile_name(profile);
+    }
+    let aws_config = aws_config_loader.load().await;
+    let s3 = aws_sdk_s3::Client::new(&aws_config);
+    let s3_bucket = config.aws.bucket;
 
-    let config = aws_config::from_env()
-        .profile_name(profile)
-        .load()
-        .await;
-    let client = S3Client::new(&config);
-
-    let remote_files = client
+    let resp = s3
         .list_objects_v2()
-        .bucket(&sync_config.aws_bucket)
+        .bucket(&s3_bucket)
         .send()
         .await?;
 
-    let mut remote_files: HashMap<String, Option<&DateTime>> = remote_files
+    let mut remote_files: HashSet<String> = resp
         .contents()
-        .unwrap()
         .iter()
-        .map(|o| (
-            o.key().unwrap().to_string(),
-            o.last_modified(),
-        ))
+        .flat_map(|o| o.key())
+        .map(String::from)
         .collect();
-
-    for file in local_files.iter() {
-        if file.extension() != Some(OsStr::new("md")) {
-            continue
-        }
-        let key = file.file_name().unwrap().to_str().unwrap();
-
-        match remote_files.remove(key) {
-            Some(d) => {
-                match SystemTime::try_from(d.unwrap().to_owned())?
-                    .cmp(&file.metadata()?.modified()?) {
-                    Ordering::Less => {
-                        println!("Uploading newer: {}", &key);
-                        put_object(
-                            &client, &sync_config.aws_bucket, file, key
-                        ).await?
-                    },
-                    Ordering::Greater => {
-                        println!("Downloading newer: {}", &key);
-                        let response = get_object(&client, &sync_config.aws_bucket, key)
-                            .await?;
-                        let agg_bytes = response
-                            .body
-                            .collect()
-                            .await
-                            .map(AggregatedBytes::into_bytes)
-                            .unwrap();
-                            
-                        let mut f = OpenOptions::new().write(true).truncate(true).open(file)?;
-                        f.write_all(&agg_bytes)?;
-                        f.flush()?;
-                    },
-                    Ordering::Equal => (),
-                }
-            }
-            _ => {
-                println!("Uploading missing: {}", &key);
-                put_object(
-                    &client, &sync_config.aws_bucket, file, key
-                ).await?
-            },
-        }
-
+    let mut manifest = match remote_files.remove("manifest.json") {
+        true => {
+            let response = s3
+                .get_object()
+                .bucket(&s3_bucket)
+                .key("manifest.json")
+                .send()
+                .await?;
+            let agg_bytes = response
+                .body
+                .collect()
+                .await
+                .map(AggregatedBytes::into_bytes)
+                .unwrap();
+            let manifest: HashMap<String, SystemTime> = serde_json::from_slice(&agg_bytes).unwrap();
+            manifest
+        },
+        false => HashMap::<String, SystemTime>::new(),
     };
+    let mut local_files = HashSet::<String>::new();
 
-    for missing_file in remote_files.keys() {
+    for dir in config.paths {
+        let dir = walkdir::WalkDir::new(dir);
+        for entry in dir
+            .into_iter()
+            .flatten()
+            .filter(|e| !e.file_type().is_dir()) {
+                let key = entry.path().to_str().unwrap();
+                let mut last_modified = entry.metadata()?.modified()?;
+                local_files.insert(String::from(key));
+                match manifest.get_mut(key) {
+                    Some(d) => {
+                        match d.cmp(&&mut last_modified) {
+                            std::cmp::Ordering::Less => {
+                                println!("Uploading newer: {}", &key);
+                                let body = ByteStream::from_path(entry.path()).await.unwrap();
+                                s3
+                                    .put_object()
+                                    .bucket(&s3_bucket)
+                                    .key(key)
+                                    .body(body)
+                                    .send()
+                                    .await?;
+                                *d = last_modified;
+                            },
+                            std::cmp::Ordering::Greater => {
+                                println!("Downloading newer: {}", &key);
+                                let response = s3
+                                    .get_object()
+                                    .bucket(&s3_bucket)
+                                    .key(key)
+                                    .send()
+                                    .await?;
+                                let agg_bytes = response
+                                    .body
+                                    .collect()
+                                    .await
+                                    .map(AggregatedBytes::into_bytes)
+                                    .unwrap();
+
+                                let mut f = std::fs::OpenOptions::new()
+                                        .write(true)
+                                        .truncate(true)
+                                        .open(key)?;
+                                f.write_all(&agg_bytes)?;
+                                f.flush()?;
+                            },
+                            std::cmp::Ordering::Equal => (),
+                        }
+                    }
+                    _ => {
+                        println!("Uploading missing: {:?}", &key);
+                        let body = ByteStream::from_path(entry.path()).await.unwrap();
+                        s3
+                            .put_object()
+                            .bucket(&s3_bucket)
+                            .key(key)
+                            .body(body)
+                            .send()
+                            .await?;
+                        manifest.insert(String::from(key), last_modified);
+                    }
+                }
+        }
+    }
+
+    for missing_file in remote_files.difference(&local_files) {
         println!("Downloading missing: {}", &missing_file);
-        let response = get_object(&client, &sync_config.aws_bucket, missing_file)
+        let response = s3
+            .get_object()
+            .bucket(&s3_bucket)
+            .key(missing_file)
+            .send()
             .await?;
         let agg_bytes = response
             .body
@@ -152,50 +156,18 @@ async fn main() -> Result<(), Box<dyn Error>>{
             .map(AggregatedBytes::into_bytes)
             .unwrap();
             
-        let download_path = dir.join(missing_file);
-        let mut f = File::create(download_path)?;
+        let mut f = std::fs::File::create(missing_file)?;
         f.write_all(&agg_bytes)?;
         f.flush()?;
     }
-    Ok(())
-}
 
-fn get_default_dir() -> Result<PathBuf, Box<dyn Error>> {
-    match document_dir() {
-        Some(d) => Ok(d.join("Obsidian Vault")),
-        _ => Err("Failed to find default Obsidian directory!".into()),
-    }
-}
-
-async fn put_object(
-    client: &S3Client,
-    bucket_name: &str,
-    file: &PathBuf,
-    key: &str,
-) -> Result<(), Box<dyn Error>> {
-    let body = ByteStream::from_path(&file).await;
-    client
+    s3
         .put_object()
-        .bucket(bucket_name)
-        .key(key)
-        .body(body.unwrap())
+        .bucket(&s3_bucket)
+        .key("manifest.json")
+        .body(serde_json::to_vec(&manifest).unwrap().into())
         .send()
         .await?;
 
     Ok(())
-}
-
-async fn get_object(
-    client: &S3Client,
-    bucket_name: &str,
-    key: &str,
-) -> Result<GetObjectOutput, Box<dyn Error>> {
-    let response = client
-        .get_object()
-        .bucket(bucket_name)
-        .key(key)
-        .send()
-        .await?;
-
-    Ok(response)
 }
