@@ -25,6 +25,8 @@ struct Aws {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let dry_run = false;
+
     let config_path = match std::env::var("S3_SYNC_CONFIG") {
         Ok(p) => PathBuf::from_str(&p).unwrap(),
         Err(_) => dirs::config_dir()
@@ -85,56 +87,64 @@ async fn main() -> Result<()> {
                 let key = entry.path().to_str().unwrap();
                 let mut last_modified = entry.metadata()?.modified()?;
                 local_files.insert(String::from(key));
-                match manifest.get_mut(key) {
+                let remote_last_modified = manifest.get_mut(key);
+                match remote_last_modified {
                     Some(d) => {
                         match d.cmp(&&mut last_modified) {
                             std::cmp::Ordering::Less => {
                                 println!("Uploading newer: {}", &key);
-                                let body = ByteStream::from_path(entry.path()).await.unwrap();
-                                s3
-                                    .put_object()
-                                    .bucket(&s3_bucket)
-                                    .key(key)
-                                    .body(body)
-                                    .send()
-                                    .await?;
+                                if !dry_run {
+                                    let body = ByteStream::from_path(entry.path()).await.unwrap();
+                                    s3
+                                        .put_object()
+                                        .bucket(&s3_bucket)
+                                        .key(key)
+                                        .body(body)
+                                        .send()
+                                        .await?;
+                                }
                                 *d = last_modified;
                             },
                             std::cmp::Ordering::Greater => {
                                 println!("Downloading newer: {}", &key);
-                                let response = s3
-                                    .get_object()
-                                    .bucket(&s3_bucket)
-                                    .key(key)
-                                    .send()
-                                    .await?;
-                                let agg_bytes = response
-                                    .body
-                                    .collect()
-                                    .await
-                                    .map(AggregatedBytes::into_bytes)
-                                    .unwrap();
+                                if !dry_run {
+                                    let response = s3
+                                        .get_object()
+                                        .bucket(&s3_bucket)
+                                        .key(key)
+                                        .send()
+                                        .await?;
+                                    let agg_bytes = response
+                                        .body
+                                        .collect()
+                                        .await
+                                        .map(AggregatedBytes::into_bytes)
+                                        .unwrap();
 
-                                let mut f = std::fs::OpenOptions::new()
-                                        .write(true)
-                                        .truncate(true)
-                                        .open(key)?;
-                                f.write_all(&agg_bytes)?;
-                                f.flush()?;
+                                    let mut f = std::fs::OpenOptions::new()
+                                            .write(true)
+                                            .truncate(true)
+                                            .open(key)?;
+                                    f.write_all(&agg_bytes)?;
+                                    f.flush()?;
+                                    f.set_modified(*d)?;
+                                }
                             },
                             std::cmp::Ordering::Equal => (),
                         }
                     }
                     _ => {
-                        println!("Uploading missing: {:?}", &key);
-                        let body = ByteStream::from_path(entry.path()).await.unwrap();
-                        s3
-                            .put_object()
-                            .bucket(&s3_bucket)
-                            .key(key)
-                            .body(body)
-                            .send()
-                            .await?;
+                        println!("Uploading missing: {}", &key);
+                        if !dry_run {
+                            let body = ByteStream::from_path(entry.path()).await.unwrap();
+                            s3
+                                .put_object()
+                                .bucket(&s3_bucket)
+                                .key(key)
+                                .body(body)
+                                .send()
+                                .await?;
+                        }
                         manifest.insert(String::from(key), last_modified);
                     }
                 }
@@ -143,31 +153,38 @@ async fn main() -> Result<()> {
 
     for missing_file in remote_files.difference(&local_files) {
         println!("Downloading missing: {}", &missing_file);
-        let response = s3
-            .get_object()
-            .bucket(&s3_bucket)
-            .key(missing_file)
-            .send()
-            .await?;
-        let agg_bytes = response
-            .body
-            .collect()
-            .await
-            .map(AggregatedBytes::into_bytes)
-            .unwrap();
-            
-        let mut f = std::fs::File::create(missing_file)?;
-        f.write_all(&agg_bytes)?;
-        f.flush()?;
+        if !dry_run {
+            if let Some(last_modified) = manifest.get(missing_file) {
+                let response = s3
+                    .get_object()
+                    .bucket(&s3_bucket)
+                    .key(missing_file)
+                    .send()
+                    .await?;
+                let agg_bytes = response
+                    .body
+                    .collect()
+                    .await
+                    .map(AggregatedBytes::into_bytes)
+                    .unwrap();
+
+                let mut f = std::fs::File::create(missing_file)?;
+                f.write_all(&agg_bytes)?;
+                f.flush()?;
+                f.set_modified(*last_modified)?;
+            }
+        }
     }
 
-    s3
-        .put_object()
-        .bucket(&s3_bucket)
-        .key("manifest.json")
-        .body(serde_json::to_vec(&manifest).unwrap().into())
-        .send()
-        .await?;
+    if !dry_run {
+        s3
+            .put_object()
+            .bucket(&s3_bucket)
+            .key("manifest.json")
+            .body(serde_json::to_vec(&manifest).unwrap().into())
+            .send()
+            .await?;
+    }
 
     Ok(())
 }
