@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    env::args,
     io::Write,
     path::PathBuf,
     str::FromStr,
@@ -25,7 +26,8 @@ struct Aws {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let dry_run = false;
+    let dry_run = args().nth(1) == Some("--dry-run".to_string());
+    println!("Dry run: {}", dry_run);
 
     let config_path = match std::env::var("S3_SYNC_CONFIG") {
         Ok(p) => PathBuf::from_str(&p).unwrap(),
