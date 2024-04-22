@@ -168,7 +168,16 @@ async fn main() -> Result<()> {
                     .map(AggregatedBytes::into_bytes)
                     .unwrap();
 
-                let mut f = std::fs::File::create(missing_file)?;
+                let path = std::path::PathBuf::from(&missing_file);
+                let path_dir = match path.is_dir() {
+                    true => path.clone(),
+                    false => path.parent().unwrap().to_path_buf(),
+                };
+                if !path_dir.exists() {
+                    std::fs::create_dir_all(&path_dir)?;
+                }
+
+                let mut f = std::fs::File::create(path)?;
                 f.write_all(&agg_bytes)?;
                 f.flush()?;
                 f.set_modified(*last_modified)?;
